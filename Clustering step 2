@@ -1,0 +1,282 @@
+import xarray as xr
+import numpy as np
+from collections import defaultdict
+from tqdm import tqdm
+
+
+# ---------------------------------------------------------------------------
+# Geometry 
+# ---------------------------------------------------------------------------
+
+def grid_cell_area_km2(latitude, grid_spacing=0.05):
+    """Area of a grid cell in km² at given latitude."""
+    earth_radius_km = 6371.0
+    lat_rad = np.radians(latitude)
+    dlat_km = (np.pi / 180) * earth_radius_km * grid_spacing
+    dlon_km = (np.pi / 180) * earth_radius_km * grid_spacing * np.cos(lat_rad)
+    return dlat_km * dlon_km
+
+
+def haversine_km(lat1_deg, lon1_deg, lat2_deg, lon2_deg):
+    
+    R = 6371.0
+    lat1, lon1 = np.radians(lat1_deg), np.radians(lon1_deg)
+    lat2, lon2 = np.radians(lat2_deg), np.radians(lon2_deg)
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    return float(2 * R * np.arcsin(np.sqrt(a)))
+
+
+def effective_radius_km(area_km2):
+    """
+    Radius of a circle with the same area as the cluster.
+    Used to set the adaptive centroid offset:
+        max_dist = k_radius * effective_radius_km(area)
+    """
+    return float(np.sqrt(area_km2 / np.pi))
+
+
+# ---------------------------------------------------------------------------
+# Cluster statistics at every timestep 
+# ---------------------------------------------------------------------------
+
+def compute_cluster_stats(cluster_map, latitudes, longitudes, grid_spacing=0.05):
+    """
+    Compute centroids (lat/lon degrees), areas (km²) and effective radii
+    for every cluster in one time step.
+
+    Parameters
+    ----------
+    cluster_map  : 2-D ndarray labels
+    latitudes    : 1-D ndarray (degrees)
+    longitudes   : 1-D ndarray (degrees)
+    grid_spacing : float
+
+    Returns
+    -------
+    stats : dict
+        {label -> {"centroid_lat": float, "centroid_lon": float,
+                   "area_km2": float, "eff_radius_km": float}}
+    """
+    stats = {}
+    labels = np.unique(cluster_map[cluster_map > 0])
+    for label in labels:
+        mask         = cluster_map == label
+        rows, cols   = np.where(mask)
+        centroid_lat = float(np.mean(latitudes[rows]))
+        centroid_lon = float(np.mean(longitudes[cols]))
+        areas        = grid_cell_area_km2(latitudes[rows], grid_spacing)
+        area_km2     = float(np.sum(areas))
+        stats[label] = {
+            "centroid_lat":  centroid_lat,
+            "centroid_lon":  centroid_lon,
+            "area_km2":      area_km2,
+            "eff_radius_km": effective_radius_km(area_km2),
+        }
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Overlap 
+# ---------------------------------------------------------------------------
+
+def compute_overlap(cluster_map_t, cluster_map_t1, cluster, next_cluster):
+    """
+    Fraction of next_cluster's area that overlaps with cluster at time t.
+    Returns 0 if next_cluster has zero area.
+    """
+    mask_t  = cluster_map_t  == cluster
+    mask_t1 = cluster_map_t1 == next_cluster
+    area_t1 = np.sum(mask_t1)
+    if area_t1 == 0:
+        return 0.0
+    return float(np.sum(mask_t & mask_t1) / area_t1)
+
+
+# ---------------------------------------------------------------------------
+# Main tracking function
+# ---------------------------------------------------------------------------
+
+def link_clusters(
+    data_array,
+    k_radius=1.0,
+    size_threshold=0.3,
+    overlap_threshold=0.1,
+    grid_spacing=0.05,
+):
+    """
+    Link per-day cluster labels into multi-day heatwave events.
+
+    Parameters
+    ----------
+    data_array        : xarray.DataArray  shape (time, lat, lon)
+    k_radius          : float
+        Scaling factor for the adaptive centroid offset.
+        max_dist_km = k_radius * sqrt(cluster_area_km2 / π)
+        Default 1.0 (centroid may move at most one effective radius per day).
+    size_threshold    : float
+        Min ratio cluster area to allow linking [0, 1].
+    overlap_threshold : float
+        Min fractional spatial overlap to allow linking.
+    grid_spacing      : float  (degrees)
+
+    Returns
+    -------
+    relabeled_xarray : xarray.DataArray  — globally unique event IDs
+    cluster_metadata : dict
+        {event_id -> {"year": int, "duration": int, "spatial_extent": float}}
+    """
+    latitudes  = data_array.coords["latitude"].values
+    longitudes = data_array.coords["longitude"].values
+    time_steps = data_array.shape[0]
+
+    event_counter = 1
+    event_mapping = {}
+    event_areas   = defaultdict(list)
+    event_years   = {}
+
+    # ------------------------------------------------------------------
+    # Precompute stats for every time step
+    # ------------------------------------------------------------------
+    all_stats = []
+    for t in range(time_steps):
+        all_stats.append(
+            compute_cluster_stats(
+                data_array.isel(time=t).values,
+                latitudes, longitudes, grid_spacing,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Link clusters across consecutive time steps
+    # ------------------------------------------------------------------
+    for t in range(time_steps - 1):
+        stats_t  = all_stats[t]
+        stats_t1 = all_stats[t + 1]
+
+        for cluster, s_t in stats_t.items():
+            size_t    = s_t["area_km2"]
+            max_dist  = k_radius * s_t["eff_radius_km"]
+
+            best_match    = None
+            best_distance = float("inf")
+
+            for next_cluster, s_t1 in stats_t1.items():
+                distance   = haversine_km(
+                    s_t["centroid_lat"],  s_t["centroid_lon"],
+                    s_t1["centroid_lat"], s_t1["centroid_lon"],
+                )
+                size_ratio = s_t1["area_km2"] / size_t if size_t > 0 else 1.0
+
+                if distance > max_dist:
+                    continue
+                if size_ratio < size_threshold or size_ratio > 1.0 / size_threshold:
+                    continue
+
+                overlap = compute_overlap(
+                    data_array.isel(time=t).values,
+                    data_array.isel(time=t + 1).values,
+                    cluster,
+                    next_cluster,
+                )
+                if overlap < overlap_threshold:
+                    continue
+
+                if distance < best_distance:
+                    best_match    = next_cluster
+                    best_distance = distance
+
+            if (t, cluster) not in event_mapping:
+                event_mapping[(t, cluster)] = event_counter
+                event_counter += 1
+            event_id = event_mapping[(t, cluster)]
+
+            event_areas[event_id].append(size_t)
+            event_years[event_id] = int(data_array["time"][t].dt.year.values)
+
+            if best_match is not None:
+                event_mapping[(t + 1, best_match)] = event_id
+
+    # ------------------------------------------------------------------
+    # Handle final time step
+    # ------------------------------------------------------------------
+    t_last = time_steps - 1
+    for cluster, s in all_stats[t_last].items():
+        if (t_last, cluster) not in event_mapping:
+            event_mapping[(t_last, cluster)] = event_counter
+            event_counter += 1
+        event_id = event_mapping[(t_last, cluster)]
+        event_areas[event_id].append(s["area_km2"])
+        event_years[event_id] = int(data_array["time"][t_last].dt.year.values)
+
+    # ------------------------------------------------------------------
+    # Build relabeled DataArray
+    # ------------------------------------------------------------------
+    relabeled_data = np.full(data_array.shape, np.nan, dtype=np.float64)
+    for (t, old_label), new_label in event_mapping.items():
+        relabeled_data[t][data_array.isel(time=t).values == old_label] = new_label
+
+    relabeled_xarray = xr.DataArray(
+        relabeled_data,
+        dims=data_array.dims,
+        coords=data_array.coords,
+        name="events",
+    )
+
+    # ------------------------------------------------------------------
+    # Assemble metadata
+    # ------------------------------------------------------------------
+    cluster_metadata = {}
+    for event_id, areas in event_areas.items():
+        cluster_metadata[event_id] = {
+            "year":           event_years[event_id],
+            "duration":       len(areas),
+            "spatial_extent": float(np.mean(areas)),
+        }
+
+    return relabeled_xarray, cluster_metadata
+
+
+# ---------------------------------------------------------------------------
+# NetCDF output
+# ---------------------------------------------------------------------------
+
+def save_metadata_to_netcdf(output_file, relabeled_xarray, metadata):
+    """
+    Save the relabeled event grid and per-event metadata to a NetCDF file.
+
+    Parameters
+    ----------
+    output_file      : str
+    relabeled_xarray : xarray.DataArray
+    metadata : dict  {event_id -> {"year", "duration", "spatial_extent"}}
+    """
+    event_ids       = list(metadata.keys())
+    years           = [meta["year"]           for meta in metadata.values()]
+    durations       = [meta["duration"]       for meta in metadata.values()]
+    spatial_extents = [meta["spatial_extent"] for meta in metadata.values()]
+
+    events_ds = relabeled_xarray.to_dataset(name="events")
+
+    metadata_ds = xr.Dataset(
+        {
+            "event_year":               ("event", np.array(years,           dtype=np.int32)),
+            "event_duration":           ("event", np.array(durations,       dtype=np.int32)),
+            "event_spatial_extent_km2": ("event", np.array(spatial_extents, dtype=np.float64)),
+        },
+        coords={"event": np.array(event_ids, dtype=np.int32)},
+        attrs={
+            "event_year_description":             "Calendar year in which the event started.",
+            "event_duration_description":         "Number of days the event was active.",
+            "event_spatial_extent_description":   "Mean daily spatial extent in km².",
+            "k_radius_description":               (
+                "Adaptive centroid offset scaling factor. "
+                "max_dist_km = k_radius * sqrt(area_km2 / pi)."
+            ),
+        },
+    )
+
+    combined_ds = xr.merge([events_ds, metadata_ds])
+    combined_ds.to_netcdf(output_file, mode="w")
+    print(f"Results saved to {output_file}")
