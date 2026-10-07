@@ -1,0 +1,233 @@
+import xarray as xr
+import numpy as np
+import regionmask
+from sklearn.cluster import DBSCAN
+from joblib import Parallel, delayed
+from tqdm import tqdm
+import gc
+
+
+# ---------------------------------------------------------------------------
+# Grid geometry
+# ---------------------------------------------------------------------------
+
+def grid_cell_area_km2(latitude, grid_spacing=0.05):
+    """Area of a grid cell in km² at the given latitude."""
+    earth_radius_km = 6371.0
+    lat_rad = np.radians(latitude)
+    dlat_km = (np.pi / 180) * earth_radius_km * grid_spacing
+    dlon_km = (np.pi / 180) * earth_radius_km * grid_spacing * np.cos(lat_rad)
+    return dlat_km * dlon_km
+
+
+def build_area_grid(latitudes, longitudes, grid_spacing=0.05):
+    """Precompute a 2-D (lat × lon) grid of cell areas in km²."""
+    areas_1d  = grid_cell_area_km2(latitudes, grid_spacing)
+    area_grid = np.broadcast_to(
+        areas_1d[:, np.newaxis], (len(latitudes), len(longitudes))
+    ).copy()
+    return area_grid
+
+
+# ---------------------------------------------------------------------------
+# Land mask
+# ---------------------------------------------------------------------------
+
+def create_land_ocean_mask(latitudes, longitudes):
+    land    = regionmask.defined_regions.natural_earth_v5_0_0.land_110
+    mask_da = land.mask(longitudes, latitudes)
+    return ~np.isnan(mask_da.values)
+
+
+# ---------------------------------------------------------------------------
+# DBSCAN
+# ---------------------------------------------------------------------------
+
+def _dbscan_single(coords_rad, eps_rad, min_samples):
+    from sklearn.cluster import DBSCAN
+    return DBSCAN(
+        eps=eps_rad,
+        min_samples=min_samples,
+        algorithm='ball_tree',
+        metric='haversine',
+        n_jobs=1,
+    ).fit(coords_rad).labels_
+
+
+def dbscan_loky(coords_rad, eps_rad, min_samples):
+    results = Parallel(n_jobs=1, backend='loky', max_nbytes=None,
+                       prefer='processes')(
+        [delayed(_dbscan_single)(coords_rad, eps_rad, min_samples)]
+    )
+    return results[0]
+
+# ---------------------------------------------------------------------------
+# Cluster metrics
+# ---------------------------------------------------------------------------
+
+def compute_cluster_metrics(cluster_map, extreme_points, area_grid):
+    """
+    Average cluster area (km²) and fraction of unclustered extreme points.
+
+    Parameters
+    ----------
+    cluster_map    : 2-D float ndarray - DBSCAN labels
+    extreme_points : 2-D ndarray       - binary 0/1 extreme indicator
+    area_grid      : 2-D float ndarray - precomputed cell areas in km²
+    """
+    unique_labels = np.unique(cluster_map[~np.isnan(cluster_map)])
+
+    if unique_labels.size == 0:
+        avg_cluster_area = 0.0
+    else:
+        cluster_areas    = [np.sum(area_grid[cluster_map == lbl])
+                            for lbl in unique_labels]
+        avg_cluster_area = float(np.mean(cluster_areas))
+
+    total_extreme   = np.nansum(extreme_points == 1)
+    if total_extreme == 0:
+        unclustered_pct = 0.0
+    elif unique_labels.size == 0:
+        unclustered_pct = 100.0
+    else:
+        unclustered     = np.nansum(np.isnan(cluster_map) & (extreme_points == 1))
+        unclustered_pct = float(unclustered / total_extreme * 100)
+
+    return avg_cluster_area, unclustered_pct
+
+# ---------------------------------------------------------------------------
+# Main processing block
+# ---------------------------------------------------------------------------
+
+def process_daily_clusters_with_metrics(
+    data_array,
+    output_file,
+    eps_km=200.0,
+    min_area_km2=75_000.0,
+    grid_spacing=0.05,
+    season_start=(6, 18),
+    season_end=(10, 11),
+):
+    """
+    Parameters
+    ----------
+    data_array   : xarray.DataArray  shape (time, lat, lon) — 0/1 extreme flag
+    output_file  : str               NetCDF file path
+    eps_km       : float             DBSCAN neighbourhood radius in km
+    min_area_km2 : float             minimum cluster area in km²
+    grid_spacing : float             grid resolution (deg)
+    season_start : (month, day)      first day of study period (inclusive)
+    season_end   : (month, day)      last day of study period (inclusive)
+
+    Returns
+    -------
+    dict with keys:
+        average_cluster_area_km2 : mean cluster area over all days (km²)
+        unclustered_percentage   : mean fraction of unclustered points (%)
+    """
+    import pandas as pd
+
+    latitudes  = data_array.coords["latitude"].values
+    longitudes = data_array.coords["longitude"].values
+    times      = pd.DatetimeIndex(data_array.coords["time"].values)
+
+    sm, sd = season_start
+    em, ed = season_end
+    season_mask = (
+        (times.month > sm) | ((times.month == sm) & (times.day >= sd))
+    ) & (
+        (times.month < em) | ((times.month == em) & (times.day <= ed))
+    )
+    season_idx = np.where(season_mask)[0]
+
+    if len(season_idx) == 0:
+        raise ValueError(
+            f"No time steps found between {sm}/{sd} and {em}/{ed}."
+        )
+
+    print(f"  Season: {times[season_idx[0]].date()} → "
+          f"{times[season_idx[-1]].date()}  ({len(season_idx)} days)")
+
+    # --- Build reusable grids ------------------------------------------------
+    area_grid       = build_area_grid(latitudes, longitudes, grid_spacing)
+    land_ocean_mask = create_land_ocean_mask(latitudes, longitudes)
+    eps_rad         = eps_km / 6371.0
+    dlat_km         = (np.pi / 180) * 6371.0 * grid_spacing
+
+    # --- Allocate output array (period length only) --------------------------
+    n_lat, n_lon   = len(latitudes), len(longitudes)
+    cluster_values = np.full((len(season_idx), n_lat, n_lon), np.nan,
+                             dtype=np.float64)
+    avg_areas, unclustered_pcts = [], []
+
+    print("  Processing daily clusters...")
+    for out_i, t in enumerate(tqdm(season_idx, desc="Days", unit="day")):
+        day_data         = data_array.isel(time=int(t)).values.astype(float)
+        eligible         = (day_data == 1) & land_ocean_mask
+        row_idx, col_idx = np.where(eligible)
+
+        if row_idx.size == 0:
+            avg_areas.append(0.0)
+            unclustered_pcts.append(
+                100.0 if np.nansum(day_data == 1) > 0 else 0.0
+            )
+            continue
+
+        # Adaptive min_samples: use mean cell area at occupied latitudes
+        occ_lats   = latitudes[row_idx]
+        dlon_pts   = (np.pi/180) * 6371.0 * grid_spacing * np.cos(np.radians(occ_lats))
+        cell_areas = dlat_km * dlon_pts
+        min_s      = max(1, int(min_area_km2 / float(np.mean(cell_areas))))
+
+        coords_rad = np.column_stack([
+            np.radians(latitudes[row_idx]),
+            np.radians(longitudes[col_idx]),
+        ])
+
+        labels = dbscan_loky(coords_rad, eps_rad, min_s)
+
+        cmap  = np.full((n_lat, n_lon), np.nan, dtype=np.float64)
+        valid = labels != -1
+        cmap[row_idx[valid], col_idx[valid]] = labels[valid] + 1
+        cluster_values[out_i] = cmap
+
+        avg_area, unc_pct = compute_cluster_metrics(cmap, day_data, area_grid)
+        avg_areas.append(avg_area)
+        unclustered_pcts.append(unc_pct)
+
+        del coords_rad, labels, cmap
+        gc.collect()
+
+    # --- Assemble DataArray with correct time coords ----------------
+    season_times = data_array.coords["time"].values[season_idx]
+    cluster_da   = xr.DataArray(
+        cluster_values,
+        dims=["time", "latitude", "longitude"],
+        coords={
+            "time":      season_times,
+            "latitude":  latitudes,
+            "longitude": longitudes,
+        },
+        name="clusters",
+        attrs={
+            "description":       "DBSCAN cluster labels (1-based). NaN = unclustered.",
+            "eps_km":            eps_km,
+            "min_area_km2":      min_area_km2,
+            "grid_spacing_deg":  grid_spacing,
+            "season_start":      f"{sm:02d}-{sd:02d}",
+            "season_end":        f"{em:02d}-{ed:02d}",
+        },
+    )
+
+    cluster_da.to_dataset(name="clusters").to_netcdf(output_file)
+    print(f"  Saved → {output_file}")
+
+    overall_avg_area    = float(np.mean(avg_areas))
+    overall_unclustered = float(np.mean(unclustered_pcts))
+    print(f"  Avg cluster area  : {overall_avg_area:,.0f} km²")
+    print(f"  Unclustered pts   : {overall_unclustered:.1f}%")
+
+    return {
+        "average_cluster_area_km2": overall_avg_area,
+        "unclustered_percentage":   overall_unclustered,
+    }
