@@ -1,0 +1,157 @@
+# =============================================================================
+# Imports and configuration
+# =============================================================================
+
+import os
+import xarray as xr
+import numpy as np
+
+# --- File paths --------------------------------------------------------------
+INPUT_DIR = "/exports/geos.ed.ac.uk/climate_change/users/Greg/LST/Arctic_cut/time_files"
+STEP1_DIR = "/exports/csce/datastore/geos/users/s2435332/clusters/step1"
+STEP2_DIR = "/exports/csce/datastore/geos/users/s2435332/clusters/step2"
+
+os.makedirs(STEP1_DIR, exist_ok=True)
+os.makedirs(STEP2_DIR, exist_ok=True)
+
+# --- Year range --------------------------------------------------------------
+YEARS = range(2000, 2023)   
+
+# --- Step 1: DBSCAN parameters  -----------------
+EPS_KM        = 200.0       # min radius in km
+MIN_AREA_KM2  = 75_000.0    # min cluster area in km²
+GRID_SPACING  = 0.05        # grid resolution in degrees
+
+# --- Study period ------------------------------------------------------------
+SEASON_START  = (6, 18)   
+SEASON_END    = (10, 11)    
+
+# --- Step 2: tracking parameters ------------------------------------------------------------
+K_RADIUS          = 1.0     # adaptive centroid offset
+SIZE_THRESHOLD    = 0.3     # min area ratio between consecutive days
+OVERLAP_THRESHOLD = 0.1     # min fractional spatial overlap
+
+print("Configuration loaded.")
+print(f"  Years             : {min(YEARS)}–{max(YEARS)}")
+print(f"  Input dir         : {INPUT_DIR}")
+print(f"  Step 1 output dir : {STEP1_DIR}")
+print(f"  Step 2 output dir : {STEP2_DIR}")
+print(f"  Season            : {SEASON_START[0]:02d}/{SEASON_START[1]:02d} – "
+      f"{SEASON_END[0]:02d}/{SEASON_END[1]:02d}")
+print(f"  eps_km            : {EPS_KM} km")
+print(f"  min_area_km2      : {MIN_AREA_KM2:,.0f} km²")
+print(f"  k_radius          : {K_RADIUS}  (adaptive offset = k × sqrt(area/π))")
+print(f"  size_threshold    : {SIZE_THRESHOLD}")
+print(f"  overlap_threshold : {OVERLAP_THRESHOLD}")
+
+
+# =============================================================================
+# CELL 2 — Step 1: spatial clustering 
+# =============================================================================
+
+step1_summary = {}
+
+for year in YEARS:
+    input_file  = os.path.join(INPUT_DIR, f"Arctic_{year}_hw.nc")
+    output_file = os.path.join(STEP1_DIR, f"2d_clusters_Arctic_{year}.nc")
+
+    if not os.path.exists(input_file):
+        print(f"[SKIP] {input_file} not found.")
+        continue
+
+    if os.path.exists(output_file):
+        print(f"[SKIP] {output_file} already exists — delete to rerun.")
+        continue
+
+    print(f"\n{'='*60}")
+    print(f"  Step 1 | Year {year}")
+    print(f"{'='*60}")
+
+    ds  = xr.open_dataset(input_file)
+    LST = ds["LST_Day_CMG"]
+
+    metrics = process_daily_clusters_with_metrics(
+        LST,
+        output_file,
+        eps_km       = EPS_KM,
+        min_area_km2 = MIN_AREA_KM2,
+        grid_spacing = GRID_SPACING,
+        season_start = SEASON_START,
+        season_end   = SEASON_END,
+    )
+
+    step1_summary[year] = metrics
+    ds.close()
+    print(f"[DONE] {year}")
+
+print("\nStep 1 complete.")
+if step1_summary:
+    print(f"{'Year':<8}  {'Avg cluster area (km²)':>24}  {'Unclustered (%)':>16}")
+    print("-" * 52)
+    for year, m in sorted(step1_summary.items()):
+        print(f"{year:<8}  "
+              f"{m['average_cluster_area_km2']:>24,.0f}  "
+              f"{m['unclustered_percentage']:>15.1f}%")
+
+
+# =============================================================================
+# CELL 3 — Step 2: spatio-temporal tracking 
+# =============================================================================
+
+step2_summary = {}
+
+for year in YEARS:
+    input_file  = os.path.join(STEP1_DIR, f"2d_clusters_Arctic_{year}.nc")
+    output_file = os.path.join(STEP2_DIR, f"3d_clusters_Arctic_{year}.nc")
+
+    if not os.path.exists(input_file):
+        print(f"[SKIP] {input_file} not found — run Step 1 first.")
+        continue
+
+    if os.path.exists(output_file):
+        print(f"[SKIP] {output_file} already exists — delete to rerun.")
+        continue
+
+    print(f"\n{'='*60}")
+    print(f"  Step 2 | Year {year}")
+    print(f"{'='*60}")
+
+    ds           = xr.open_dataset(input_file)
+    cluster_data = ds["clusters"]
+
+    relabeled, metadata = link_clusters(
+        cluster_data,
+        k_radius          = K_RADIUS,
+        size_threshold    = SIZE_THRESHOLD,
+        overlap_threshold = OVERLAP_THRESHOLD,
+        grid_spacing      = GRID_SPACING,
+    )
+
+    save_metadata_to_netcdf(output_file, relabeled, metadata)
+    ds.close()
+
+    n_events = len(metadata)
+    mean_dur = float(np.mean([m["duration"]       for m in metadata.values()])) \
+               if n_events > 0 else 0.0
+    mean_ext = float(np.mean([m["spatial_extent"] for m in metadata.values()])) \
+               if n_events > 0 else 0.0
+
+    step2_summary[year] = {
+        "n_events":        n_events,
+        "mean_duration":   mean_dur,
+        "mean_extent_km2": mean_ext,
+    }
+    print(f"[DONE] {year} | {n_events} events | "
+          f"mean duration {mean_dur:.1f} d | "
+          f"mean extent {mean_ext:,.0f} km²")
+
+print("\nStep 2 complete.")
+if step2_summary:
+    print(f"{'Year':<8}  {'Events':>8}  {'Mean dur (d)':>14}  "
+          f"{'Mean extent (km²)':>18}")
+    print("-" * 54)
+    for year, s in sorted(step2_summary.items()):
+        print(f"{year:<8}  "
+              f"{s['n_events']:>8}  "
+              f"{s['mean_duration']:>14.1f}  "
+              f"{s['mean_extent_km2']:>18,.0f}")
